@@ -1,6 +1,6 @@
 ﻿namespace MQTTnet.Extensions.ManagedClient
 {
-    public enum ReconnectionResult
+    public enum ConnectionStatus
     {
         StillConnected,
         Reconnected,

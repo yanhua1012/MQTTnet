@@ -11,10 +11,20 @@ using MQTTnet.Protocol;
 
 namespace MQTTnet.Extensions.ManagedClient
 {
+    public class ManagedSubscription
+    {
+        public MqttQualityOfServiceLevel QualityOfServiceLevel { get; set; }
+
+        public bool IsPublished { get; set; }
+    }
+
     public class ManagedMqttClient : IManagedMqttClient
     {
         private readonly BlockingCollection<ManagedMqttApplicationMessage> _messageQueue = new BlockingCollection<ManagedMqttApplicationMessage>();
-        private readonly Dictionary<string, MqttQualityOfServiceLevel> _subscriptions = new Dictionary<string, MqttQualityOfServiceLevel>();
+
+        //private readonly Dictionary<string, MqttQualityOfServiceLevel> _subscriptions = new Dictionary<string, MqttQualityOfServiceLevel>();
+
+        private readonly Dictionary<string, ManagedSubscription> _subscriptions = new Dictionary<string, ManagedSubscription>();
         private readonly HashSet<string> _unsubscriptions = new HashSet<string>();
 
         private readonly IMqttClient _mqttClient;
@@ -128,10 +138,34 @@ namespace MQTTnet.Extensions.ManagedClient
             {
                 foreach (var topicFilter in topicFilters)
                 {
-                    _subscriptions[topicFilter.Topic] = topicFilter.QualityOfServiceLevel;
-                    _subscriptionsNotPushed = true;
+                    if (_subscriptions.TryGetValue(topicFilter.Topic, out var existingSubscription))
+                    {
+                        if (existingSubscription.QualityOfServiceLevel == topicFilter.QualityOfServiceLevel &&
+                            existingSubscription.IsPublished)
+                        {
+                            _logger.Info($"Skipping subscription if topic '{topicFilter}' because it is already subscribed.");
+                            continue;
+                        }
+                    }
+
+                    _subscriptions[topicFilter.Topic] = new ManagedSubscription
+                    {
+                        QualityOfServiceLevel = topicFilter.QualityOfServiceLevel,
+                        IsPublished = false
+                    };
                 }
             }
+
+            Task.Run(TrySynchronizeSubscriptionsAsync);
+
+            ////lock (_subscriptions)
+            ////{
+            ////    foreach (var topicFilter in topicFilters)
+            ////    {
+            ////        _subscriptions[topicFilter.Topic] = topicFilter.QualityOfServiceLevel;
+            ////        _subscriptionsNotPushed = true;
+            ////    }
+            ////}
 
             return Task.FromResult(0);
         }
@@ -147,10 +181,12 @@ namespace MQTTnet.Extensions.ManagedClient
                     if (_subscriptions.Remove(topic))
                     {
                         _unsubscriptions.Add(topic);
-                        _subscriptionsNotPushed = true;
+                        ////_subscriptionsNotPushed = true;
                     }
                 }
             }
+
+            Task.Run(TrySynchronizeSubscriptionsAsync);
 
             return Task.FromResult(0);
         }
@@ -189,24 +225,39 @@ namespace MQTTnet.Extensions.ManagedClient
         {
             try
             {
-                var connectionState = await ReconnectIfRequiredAsync().ConfigureAwait(false);
-                if (connectionState == ReconnectionResult.NotConnected)
+                var ensureIsConnectedResult = await EnsureIsConnectedAsync().ConfigureAwait(false);
+
+                if (ensureIsConnectedResult.ConnectionStatus == ConnectionStatus.StillConnected)
+                {
+                    await Task.Delay(_options.ConnectionCheckInterval, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                if (ensureIsConnectedResult.ConnectionStatus == ConnectionStatus.NotConnected)
                 {
                     StopPublishing();
+
                     await Task.Delay(_options.AutoReconnectDelay, cancellationToken).ConfigureAwait(false);
                     return;
                 }
 
-                if (connectionState == ReconnectionResult.Reconnected || _subscriptionsNotPushed)
+                if (ensureIsConnectedResult.ConnectionStatus == ConnectionStatus.Reconnected || _subscriptionsNotPushed)
                 {
-                    await SynchronizeSubscriptionsAsync().ConfigureAwait(false);
-                    StartPublishing();
-                    return;
-                }
+                    // Reset the subscription status if the session is new to force
+                    // a resend of all subscriptions.
+                    if (!ensureIsConnectedResult.IsExistingSession)
+                    {
+                        lock (_subscriptions)
+                        {
+                            foreach (var subscription in _subscriptions)
+                            {
+                                subscription.Value.IsPublished = false;
+                            }
+                        }
+                    }
 
-                if (connectionState == ReconnectionResult.StillConnected)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                    await TrySynchronizeSubscriptionsAsync().ConfigureAwait(false);
+                    StartPublishing();
                 }
             }
             catch (OperationCanceledException)
@@ -222,7 +273,7 @@ namespace MQTTnet.Extensions.ManagedClient
             }
         }
 
-        private void PublishQueuedMessages(CancellationToken cancellationToken)
+        private void TryPublishQueuedMessages(CancellationToken cancellationToken)
         {
             try
             {
@@ -282,65 +333,149 @@ namespace MQTTnet.Extensions.ManagedClient
             }
         }
 
-        private async Task SynchronizeSubscriptionsAsync()
+        private Task TrySynchronizeSubscriptionsAsync()
         {
-            _logger.Info(nameof(ManagedMqttClient), "Synchronizing subscriptions");
+            _logger.Info(nameof(ManagedMqttClient), "Synchronizing subscriptions.");
 
-            List<TopicFilter> subscriptions;
-            HashSet<string> unsubscriptions;
-
-            lock (_subscriptions)
-            {
-                subscriptions = _subscriptions.Select(i => new TopicFilter(i.Key, i.Value)).ToList();
-
-                unsubscriptions = new HashSet<string>(_unsubscriptions);
-                _unsubscriptions.Clear();
-
-                _subscriptionsNotPushed = false;
-            }
-
-            if (!subscriptions.Any() && !unsubscriptions.Any())
-            {
-                return;
-            }
+            // TODO: Make async.
 
             try
             {
-                if (subscriptions.Any())
+                lock (_subscriptions)
                 {
-                    await _mqttClient.SubscribeAsync(subscriptions).ConfigureAwait(false);
+                    if (!_subscriptions.Any(s => s.Value.IsPublished))
+                    {
+                        _logger.Verbose("No pending subscriptions.");
+                    }
+                    else
+                    {
+                        foreach (var subscription in _subscriptions)
+                        {
+                            if (subscription.Value.IsPublished)
+                            {
+                                continue;
+                            }
+
+                            var result = _mqttClient.SubscribeAsync(subscription.Key, subscription.Value.QualityOfServiceLevel).GetAwaiter().GetResult();
+                            if (result[0].ReturnCode == MqttSubscribeReturnCode.Failure)
+                            {
+                                _logger.Warning(null, $"Server returned _failure_ for subscription '{subscription.Key}@{subscription.Value.QualityOfServiceLevel}'.");
+                            }
+                            else
+                            {
+                                _logger.Verbose($"Published subscription '{subscription.Key}@{subscription.Value.QualityOfServiceLevel}'.");
+                                subscription.Value.IsPublished = true;
+                            }
+                        }
+                    }
                 }
 
-                if (unsubscriptions.Any())
+                lock (_unsubscriptions)
                 {
-                    await _mqttClient.UnsubscribeAsync(unsubscriptions).ConfigureAwait(false);
+                    if (!_subscriptions.Any(s => s.Value.IsPublished))
+                    {
+                        _logger.Verbose("No pending unsubscriptions.");
+                    }
+                    else
+                    {
+                        foreach (var unsubscription in _unsubscriptions.ToList())
+                        {
+                            _mqttClient.UnsubscribeAsync(unsubscription).GetAwaiter().GetResult();
+
+                            _unsubscriptions.Remove(unsubscription);
+                        }
+                    }
                 }
             }
             catch (Exception exception)
             {
                 _logger.Warning(exception, "Synchronizing subscriptions failed.");
-                _subscriptionsNotPushed = true;
-
                 SynchronizingSubscriptionsFailed?.Invoke(this, new MqttManagedProcessFailedEventArgs(exception));
             }
+
+            return Task.FromResult(0);
+
+
+
+
+            ////_logger.Info(nameof(ManagedMqttClient), "Synchronizing subscriptions");
+
+            ////List<TopicFilter> subscriptions;
+            ////HashSet<string> unsubscriptions;
+
+            ////lock (_subscriptions)
+            ////{
+            ////    subscriptions = _subscriptions.Select(i => new TopicFilter(i.Key, i.Value)).ToList();
+
+            ////    unsubscriptions = new HashSet<string>(_unsubscriptions);
+            ////    _unsubscriptions.Clear();
+
+            ////    _subscriptionsNotPushed = false;
+            ////}
+
+            ////if (!subscriptions.Any() && !unsubscriptions.Any())
+            ////{
+            ////    return;
+            ////}
+
+            ////try
+            ////{
+            ////    if (subscriptions.Any())
+            ////    {
+            ////        await _mqttClient.SubscribeAsync(subscriptions).ConfigureAwait(false);
+            ////    }
+
+            ////    if (unsubscriptions.Any())
+            ////    {
+            ////        await _mqttClient.UnsubscribeAsync(unsubscriptions).ConfigureAwait(false);
+            ////    }
+            ////}
+            ////catch (Exception exception)
+            ////{
+            ////    _logger.Warning(exception, "Synchronizing subscriptions failed.");
+            ////    _subscriptionsNotPushed = true;
+
+            ////    SynchronizingSubscriptionsFailed?.Invoke(this, new MqttManagedProcessFailedEventArgs(exception));
+            ////}
         }
 
-        private async Task<ReconnectionResult> ReconnectIfRequiredAsync()
+        public class EnsureIsConnectedResult
+        {
+            public ConnectionStatus ConnectionStatus { get; set; }
+
+            public bool IsExistingSession { get; set; }
+        }
+
+        private async Task<EnsureIsConnectedResult> EnsureIsConnectedAsync()
         {
             if (_mqttClient.IsConnected)
             {
-                return ReconnectionResult.StillConnected;
+                return new EnsureIsConnectedResult
+                {
+                    ConnectionStatus = ConnectionStatus.StillConnected,
+                    IsExistingSession = true
+                };
             }
 
             try
             {
-                await _mqttClient.ConnectAsync(_options.ClientOptions).ConfigureAwait(false);
-                return ReconnectionResult.Reconnected;
+                var connectResult = await _mqttClient.ConnectAsync(_options.ClientOptions).ConfigureAwait(false);
+
+                return new EnsureIsConnectedResult
+                {
+                    ConnectionStatus = ConnectionStatus.Reconnected,
+                    IsExistingSession = connectResult.IsSessionPresent
+                };
             }
             catch (Exception exception)
             {
                 ConnectingFailed?.Invoke(this, new MqttManagedProcessFailedEventArgs(exception));
-                return ReconnectionResult.NotConnected;
+
+                return new EnsureIsConnectedResult
+                {
+                    ConnectionStatus = ConnectionStatus.NotConnected,
+                    IsExistingSession = false
+                };
             }
         }
 
@@ -370,7 +505,10 @@ namespace MQTTnet.Extensions.ManagedClient
 
             _publishingCancellationToken = cts;
 
-            Task.Factory.StartNew(() => PublishQueuedMessages(cts.Token), cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            // The message publishing thread uses no async/await to increase performance.
+            // Blocking one single thread for this is an acceptable strategy for a client
+            // library.
+            Task.Factory.StartNew(() => TryPublishQueuedMessages(cts.Token), cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         private void StopPublishing()
